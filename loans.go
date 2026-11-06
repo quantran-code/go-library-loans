@@ -6,8 +6,11 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"time"
+
+	"github.com/go-chi/chi/v5"
 )
 
 // loanPeriod is how long a borrowed book may be kept.
@@ -19,10 +22,11 @@ const defaultCatalogURL = "http://localhost:8081"
 
 // Loan is a book taken out of the catalogue.
 type Loan struct {
-	ID         int       `json:"id"`
-	BookID     int       `json:"bookId"`
-	BorrowedAt time.Time `json:"borrowedAt"`
-	DueAt      time.Time `json:"dueAt"`
+	ID         int        `json:"id"`
+	BookID     int        `json:"bookId"`
+	BorrowedAt time.Time  `json:"borrowedAt"`
+	DueAt      time.Time  `json:"dueAt"`
+	ReturnedAt *time.Time `json:"returnedAt,omitempty"`
 }
 
 var (
@@ -95,6 +99,75 @@ func newBorrowHandler(catalogURL string) http.HandlerFunc {
 	}
 }
 
+// newListLoansHandler answers with every recorded loan.
+func newListLoansHandler() http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		stored := loans
+		if stored == nil {
+			// A nil slice would encode as null, which is not a list for clients.
+			stored = []Loan{}
+		}
+		writeJSON(w, http.StatusOK, stored)
+	}
+}
+
+// newGetLoanHandler answers with the recorded loan named in the path.
+func newGetLoanHandler() http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		id, err := strconv.Atoi(chi.URLParam(r, "id"))
+		if err != nil || id <= 0 {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid loan id"})
+			return
+		}
+		for _, loan := range loans {
+			if loan.ID == id {
+				writeJSON(w, http.StatusOK, loan)
+				return
+			}
+		}
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "loan not found"})
+	}
+}
+
+// newReturnHandler returns a loan and puts its book back in the catalogue.
+func newReturnHandler(catalogURL string) http.HandlerFunc {
+	base := strings.TrimRight(catalogURL, "/")
+
+	return func(w http.ResponseWriter, r *http.Request) {
+		id, err := strconv.Atoi(chi.URLParam(r, "id"))
+		if err != nil || id <= 0 {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid loan id"})
+			return
+		}
+
+		index := -1
+		for i, loan := range loans {
+			if loan.ID == id {
+				index = i
+				break
+			}
+		}
+		if index == -1 {
+			writeJSON(w, http.StatusNotFound, map[string]string{"error": "loan not found"})
+			return
+		}
+		if loans[index].ReturnedAt != nil {
+			writeJSON(w, http.StatusConflict, map[string]string{"error": "loan already returned"})
+			return
+		}
+
+		if status, message := setBookAvailability(r, base, loans[index].BookID, true); message != "" {
+			writeJSON(w, status, map[string]string{"error": message})
+			return
+		}
+
+		returnedAt := time.Now().UTC()
+		loans[index].ReturnedAt = &returnedAt
+
+		writeJSON(w, http.StatusOK, loans[index])
+	}
+}
+
 // fetchCatalogBook reads the book from the catalogue. On failure it returns a
 // status and error message for the caller to write.
 func fetchCatalogBook(r *http.Request, base string, id int) (catalogBook, int, string) {
@@ -125,7 +198,13 @@ func fetchCatalogBook(r *http.Request, base string, id int) (catalogBook, int, s
 // markBookUnavailable flips the book's availability in the catalogue. On
 // failure it returns a status and error message for the caller to write.
 func markBookUnavailable(r *http.Request, base string, id int) (int, string) {
-	body := []byte(`{"available":false}`)
+	return setBookAvailability(r, base, id, false)
+}
+
+// setBookAvailability sets the book's availability in the catalogue. On
+// failure it returns a status and error message for the caller to write.
+func setBookAvailability(r *http.Request, base string, id int, available bool) (int, string) {
+	body := []byte(fmt.Sprintf(`{"available":%t}`, available))
 
 	req, err := http.NewRequestWithContext(r.Context(), http.MethodPatch, fmt.Sprintf("%s/books/%d/availability", base, id), bytes.NewReader(body))
 	if err != nil {
