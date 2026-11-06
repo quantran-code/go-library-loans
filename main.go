@@ -26,5 +26,6 @@ func NewRouter() http.Handler {
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
 	})
+	r.Post("/loans", newBorrowHandler(catalogURLFromEnv()))
 	return r
 }
