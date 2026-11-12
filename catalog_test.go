@@ -112,3 +112,65 @@ func TestSetAvailabilityPatchesTheCatalogue(t *testing.T) {
 		t.Fatalf("expected an error for an unreachable catalogue")
 	}
 }
+
+func TestCatalogClientForwardsTheRequestIDFromContext(t *testing.T) {
+	const id = "9f2c4a1e5b6d7c8a9b0c1d2e3f4a5b6c"
+
+	var ids []string
+	stub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ids = append(ids, r.Header.Get("X-Request-Id"))
+		w.Header().Set("Content-Type", "application/json")
+		if r.Method == http.MethodGet {
+			_, _ = w.Write([]byte(`{"id":7,"title":"Dune","author":"Frank Herbert","available":false}`))
+			return
+		}
+		_, _ = w.Write([]byte(`{"id":7,"available":true}`))
+	}))
+	defer stub.Close()
+
+	ctx := context.WithValue(context.Background(), requestIDKey{}, id)
+	client := NewCatalogClient(stub.URL)
+
+	if _, _, err := client.GetBook(ctx, 7); err != nil {
+		t.Fatalf("getting book: %v", err)
+	}
+	if err := client.SetAvailability(ctx, 7, true); err != nil {
+		t.Fatalf("setting availability: %v", err)
+	}
+
+	if len(ids) != 2 {
+		t.Fatalf("catalogue saw %d requests, want 2: %v", len(ids), ids)
+	}
+	for i, got := range ids {
+		if got != id {
+			t.Fatalf("request %d carried X-Request-Id %q, want %q", i, got, id)
+		}
+	}
+}
+
+func TestCatalogClientSendsNoRequestIDWithoutOne(t *testing.T) {
+	var ids []string
+	stub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ids = append(ids, r.Header.Values("X-Request-Id")...)
+		w.Header().Set("Content-Type", "application/json")
+		if r.Method == http.MethodGet {
+			_, _ = w.Write([]byte(`{"id":7,"title":"Dune","author":"Frank Herbert","available":false}`))
+			return
+		}
+		_, _ = w.Write([]byte(`{"id":7,"available":true}`))
+	}))
+	defer stub.Close()
+
+	client := NewCatalogClient(stub.URL)
+
+	if _, _, err := client.GetBook(context.Background(), 7); err != nil {
+		t.Fatalf("getting book: %v", err)
+	}
+	if err := client.SetAvailability(context.Background(), 7, true); err != nil {
+		t.Fatalf("setting availability: %v", err)
+	}
+
+	if len(ids) != 0 {
+		t.Fatalf("catalogue saw X-Request-Id %v, want none", ids)
+	}
+}

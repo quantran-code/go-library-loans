@@ -48,7 +48,7 @@ func newRouter(store LoanStore, catalog *CatalogClient) http.Handler {
 	r.Get("/loans", listLoans(store))
 	r.Get("/loans/{id}", getLoan(store))
 	r.Post("/loans/{id}/return", returnLoan(store, catalog))
-	return r
+	return withRequestID(r)
 }
 
 // createLoan takes the copy off the shelf and records the loan, putting the

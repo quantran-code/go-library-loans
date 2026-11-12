@@ -1,10 +1,14 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
+	"log"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"regexp"
 	"strings"
 	"sync"
 	"testing"
@@ -28,11 +32,217 @@ func TestHealthReportsTheServiceIsUp(t *testing.T) {
 	}
 }
 
+// testRequestID is a 32 lowercase hex id, the shape the entry point mints.
+const testRequestID = "9f2c4a1e5b6d7c8a9b0c1d2e3f4a5b6c"
+
+// getPathWithRequestID sends a GET carrying the supplied request id.
+func getPathWithRequestID(t *testing.T, router http.Handler, path, requestID string) *httptest.ResponseRecorder {
+	t.Helper()
+
+	req := httptest.NewRequest(http.MethodGet, path, nil)
+	req.Header.Set(requestIDHeader, requestID)
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+	return rec
+}
+
+// postWithRequestID sends a POST carrying the supplied request id.
+func postWithRequestID(t *testing.T, router http.Handler, path, body, requestID string) *httptest.ResponseRecorder {
+	t.Helper()
+
+	req := httptest.NewRequest(http.MethodPost, path, strings.NewReader(body))
+	req.Header.Set(requestIDHeader, requestID)
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+	return rec
+}
+
+// logLines returns the non-empty lines of the captured log output.
+func logLines(buf *bytes.Buffer) []string {
+	var lines []string
+	for _, line := range strings.Split(buf.String(), "\n") {
+		if strings.TrimSpace(line) != "" {
+			lines = append(lines, line)
+		}
+	}
+	return lines
+}
+
+func TestRequestIDIsEchoedAndLogged(t *testing.T) {
+	store := NewMemoryLoanStore()
+	recordLoan(t, store)
+	stub := newStubCatalog(t, http.StatusOK, bookOnLoanJSON, http.StatusOK)
+	router := newRouter(store, NewCatalogClient(stub.server.URL))
+
+	var buf bytes.Buffer
+	log.SetOutput(&buf)
+	defer log.SetOutput(os.Stderr)
+
+	rec := getPathWithRequestID(t, router, "/loans/1", testRequestID)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status %d, body %s", rec.Code, rec.Body.String())
+	}
+	if got := rec.Header().Get(requestIDHeader); got != testRequestID {
+		t.Fatalf("response X-Request-Id %q, want %q", got, testRequestID)
+	}
+
+	lines := logLines(&buf)
+	if len(lines) != 1 {
+		t.Fatalf("logged %d lines, want 1: %q", len(lines), buf.String())
+	}
+	for _, want := range []string{"method=GET", "path=/loans/1", "status=200", "request_id=" + testRequestID} {
+		if !strings.Contains(lines[0], want) {
+			t.Fatalf("log line %q does not contain %q", lines[0], want)
+		}
+	}
+}
+
+func TestMissingRequestIDIsNotInvented(t *testing.T) {
+	stub := newStubCatalog(t, http.StatusOK, availableBookJSON, http.StatusOK)
+	router := newRouter(NewMemoryLoanStore(), NewCatalogClient(stub.server.URL))
+
+	var buf bytes.Buffer
+	log.SetOutput(&buf)
+	defer log.SetOutput(os.Stderr)
+
+	listed := getPath(t, router, "/loans")
+	if listed.Code != http.StatusOK {
+		t.Fatalf("status %d, body %s", listed.Code, listed.Body.String())
+	}
+	if got := listed.Header().Get(requestIDHeader); got != "" {
+		t.Fatalf("response X-Request-Id %q, want none", got)
+	}
+	lines := logLines(&buf)
+	if len(lines) != 1 {
+		t.Fatalf("logged %d lines, want 1: %q", len(lines), buf.String())
+	}
+	if !strings.Contains(lines[0], "request_id=(none)") {
+		t.Fatalf("log line %q does not say request_id=(none)", lines[0])
+	}
+
+	buf.Reset()
+
+	borrowed := postLoan(t, router, `{"bookId":1}`)
+	if borrowed.Code != http.StatusCreated {
+		t.Fatalf("borrow status %d, body %s", borrowed.Code, borrowed.Body.String())
+	}
+	if got := borrowed.Header().Get(requestIDHeader); got != "" {
+		t.Fatalf("borrow response X-Request-Id %q, want none", got)
+	}
+
+	requests := stub.seen()
+	if len(requests) != 2 {
+		t.Fatalf("catalogue saw %d requests, want 2: %+v", len(requests), requests)
+	}
+	for _, seen := range requests {
+		if seen.requestID != "" {
+			t.Fatalf("%s %s carried X-Request-Id %q, want none", seen.method, seen.path, seen.requestID)
+		}
+	}
+
+	logged := buf.String()
+	if !strings.Contains(logged, "request_id=(none)") {
+		t.Fatalf("log %q does not say request_id=(none)", logged)
+	}
+	if invented := regexp.MustCompile(`[0-9a-f]{32}`).FindString(logged); invented != "" {
+		t.Fatalf("log %q carries the invented id %q", logged, invented)
+	}
+}
+
+func TestBorrowCarriesOneIdThroughTheWholeChain(t *testing.T) {
+	stub := newStubCatalog(t, http.StatusOK, availableBookJSON, http.StatusOK)
+	router := newRouter(NewMemoryLoanStore(), NewCatalogClient(stub.server.URL))
+
+	var buf bytes.Buffer
+	log.SetOutput(&buf)
+	defer log.SetOutput(os.Stderr)
+
+	rec := postWithRequestID(t, router, "/loans", `{"bookId":1}`, testRequestID)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("status %d, body %s", rec.Code, rec.Body.String())
+	}
+	if got := rec.Header().Get(requestIDHeader); got != testRequestID {
+		t.Fatalf("response X-Request-Id %q, want %q", got, testRequestID)
+	}
+
+	requests := stub.seen()
+	if len(requests) != 2 {
+		t.Fatalf("catalogue saw %d requests, want 2: %+v", len(requests), requests)
+	}
+	if requests[0].method != http.MethodGet || requests[0].path != "/books/1" {
+		t.Fatalf("first request %+v, want GET /books/1", requests[0])
+	}
+	if requests[1].method != http.MethodPatch || requests[1].path != "/books/1/availability" {
+		t.Fatalf("second request %+v, want PATCH /books/1/availability", requests[1])
+	}
+	for _, seen := range requests {
+		if seen.requestID != testRequestID {
+			t.Fatalf("%s %s carried X-Request-Id %q, want %q", seen.method, seen.path, seen.requestID, testRequestID)
+		}
+	}
+
+	lines := logLines(&buf)
+	if len(lines) != 1 {
+		t.Fatalf("logged %d lines, want 1: %q", len(lines), buf.String())
+	}
+	for _, want := range []string{"method=POST", "path=/loans", "status=201", "request_id=" + testRequestID} {
+		if !strings.Contains(lines[0], want) {
+			t.Fatalf("log line %q does not contain %q", lines[0], want)
+		}
+	}
+}
+
+func TestReturnCarriesTheRequestIDToTheCatalogue(t *testing.T) {
+	store := NewMemoryLoanStore()
+	recordLoan(t, store)
+	stub := newStubCatalog(t, http.StatusOK, bookOnLoanJSON, http.StatusOK)
+	router := newRouter(store, NewCatalogClient(stub.server.URL))
+
+	var buf bytes.Buffer
+	log.SetOutput(&buf)
+	defer log.SetOutput(os.Stderr)
+
+	rec := postWithRequestID(t, router, "/loans/1/return", "", testRequestID)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status %d, body %s", rec.Code, rec.Body.String())
+	}
+	if got := rec.Header().Get(requestIDHeader); got != testRequestID {
+		t.Fatalf("response X-Request-Id %q, want %q", got, testRequestID)
+	}
+
+	requests := stub.seen()
+	if len(requests) != 2 {
+		t.Fatalf("catalogue saw %d requests, want 2: %+v", len(requests), requests)
+	}
+	if requests[0].method != http.MethodGet || requests[0].path != "/books/1" {
+		t.Fatalf("first request %+v, want GET /books/1", requests[0])
+	}
+	if requests[1].method != http.MethodPatch || requests[1].path != "/books/1/availability" {
+		t.Fatalf("second request %+v, want PATCH /books/1/availability", requests[1])
+	}
+	for _, seen := range requests {
+		if seen.requestID != testRequestID {
+			t.Fatalf("%s %s carried X-Request-Id %q, want %q", seen.method, seen.path, seen.requestID, testRequestID)
+		}
+	}
+
+	lines := logLines(&buf)
+	if len(lines) != 1 {
+		t.Fatalf("logged %d lines, want 1: %q", len(lines), buf.String())
+	}
+	for _, want := range []string{"method=POST", "path=/loans/1/return", "status=200", "request_id=" + testRequestID} {
+		if !strings.Contains(lines[0], want) {
+			t.Fatalf("log line %q does not contain %q", lines[0], want)
+		}
+	}
+}
+
 // catalogRequest is one call the stub catalogue saw.
 type catalogRequest struct {
-	method string
-	path   string
-	body   map[string]bool
+	method    string
+	path      string
+	body      map[string]bool
+	requestID string
 }
 
 // stubCatalog answers GET /books/{id} with a fixed book and records every
@@ -51,7 +261,7 @@ func newStubCatalog(t *testing.T, getStatus int, book string, patchStatus int) *
 
 	stub := &stubCatalog{getStatus: getStatus, book: book, patchStatus: patchStatus}
 	stub.server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		seen := catalogRequest{method: r.Method, path: r.URL.Path}
+		seen := catalogRequest{method: r.Method, path: r.URL.Path, requestID: r.Header.Get(requestIDHeader)}
 		if r.Method == http.MethodPatch {
 			var body map[string]bool
 			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {

@@ -40,6 +40,9 @@ func (c *CatalogClient) GetBook(ctx context.Context, id int) (Book, bool, error)
 	if err != nil {
 		return Book{}, false, fmt.Errorf("building request for book %d: %w", id, err)
 	}
+	if requestID := requestIDFrom(ctx); requestID != "" {
+		req.Header.Set(requestIDHeader, requestID)
+	}
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
@@ -76,6 +79,9 @@ func (c *CatalogClient) SetAvailability(ctx context.Context, id int, available b
 		return fmt.Errorf("building availability request for book %d: %w", id, err)
 	}
 	req.Header.Set("Content-Type", "application/json")
+	if requestID := requestIDFrom(ctx); requestID != "" {
+		req.Header.Set(requestIDHeader, requestID)
+	}
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
