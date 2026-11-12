@@ -46,6 +46,8 @@ func newRouter(store LoanStore, catalog *CatalogClient) http.Handler {
 	})
 	r.Post("/loans", createLoan(store, catalog))
 	r.Get("/loans", listLoans(store))
+	// Registered before /loans/{id} so "export" is never parsed as a loan id.
+	r.Get("/loans/export", exportLoans(store))
 	r.Get("/loans/{id}", getLoan(store))
 	r.Post("/loans/{id}/return", returnLoan(store, catalog))
 	return withRequestID(r)
