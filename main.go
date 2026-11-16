@@ -22,7 +22,28 @@ func main() {
 		port = "8082"
 	}
 	log.Printf("loans listening on :%s", port)
-	log.Fatal(http.ListenAndServe(":"+port, NewRouter()))
+	router := newRouterWithStorage(NewMemoryLoanStore(), NewCatalogClient(catalogURL()), storageFromEnv())
+	log.Fatal(http.ListenAndServe(":"+port, router))
+}
+
+// storageFromEnv builds the object storage client from the S3_* variables. It
+// reports disabled storage and lets the service boot when they are unset, and
+// never logs a credential.
+func storageFromEnv() objectStorage {
+	cfg, ok := storageConfigFromEnv(os.Getenv)
+	if !ok {
+		log.Printf("object storage disabled: S3_ENDPOINT, S3_BUCKET, S3_ACCESS_KEY and S3_SECRET_KEY must all be set")
+		return nil
+	}
+
+	storage, err := newMinioStorage(cfg)
+	if err != nil {
+		log.Printf("object storage disabled: %v", err)
+		return nil
+	}
+
+	log.Printf("object storage enabled: endpoint=%s bucket=%s", cfg.Endpoint, cfg.Bucket)
+	return storage
 }
 
 // catalogURL returns the catalogue's address, defaulting to the local port.
@@ -40,6 +61,12 @@ func NewRouter() http.Handler {
 
 // newRouter wires the loan API around the supplied store and catalogue client.
 func newRouter(store LoanStore, catalog *CatalogClient) http.Handler {
+	return newRouterWithStorage(store, catalog, nil)
+}
+
+// newRouterWithStorage wires the loan API around the supplied store, catalogue
+// client and object storage. A nil storage answers the S3 export with 503.
+func newRouterWithStorage(store LoanStore, catalog *CatalogClient, storage objectStorage) http.Handler {
 	r := chi.NewRouter()
 	r.Get("/health", func(w http.ResponseWriter, _ *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
@@ -48,6 +75,8 @@ func newRouter(store LoanStore, catalog *CatalogClient) http.Handler {
 	r.Get("/loans", listLoans(store))
 	// Registered before /loans/{id} so "export" is never parsed as a loan id.
 	r.Get("/loans/export", exportLoans(store))
+	// Registered before /loans/{id} too: "export-s3" is a route, not an id.
+	r.Post("/loans/export-s3", exportLoansToS3(store, storage, time.Now))
 	r.Get("/loans/{id}", getLoan(store))
 	r.Post("/loans/{id}/return", returnLoan(store, catalog))
 	return withRequestID(r)
